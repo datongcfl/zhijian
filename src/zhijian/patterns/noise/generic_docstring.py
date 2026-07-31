@@ -1,8 +1,6 @@
 """噪音检测：通用文档字符串检测器
 
-检测无信息量的通用文档字符串，例如：
-- """This function does stuff"""
-- """This method handles things"""
+检测无信息量的通用文档字符串。
 """
 
 import re
