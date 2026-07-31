@@ -36,3 +36,9 @@ htmlcov/
 # Config (user-specific)
 .slopconfig.yaml
 .zhijian.yaml
+
+# 扫描报告（含敏感项目信息）
+*-report.json
+*-report.md
+*-report.html
+GitHubDesktopSetup.exe
