@@ -1,0 +1,954 @@
+"""Core SLOP detector with improved architecture."""
+
+from __future__ import annotations
+
+import ast
+import fnmatch
+import hashlib
+import logging
+import math
+from collections import Counter
+from math import exp, log, sqrt
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+from zhijian.analysis_cache import CACHE_ENGINE_VERSION, FileAnalysisCache, fingerprint_config
+from zhijian.config import Config
+from zhijian.file_role import classify_file
+from zhijian.ignore_handler import IgnoreHandler
+from zhijian.masking import FrameworkMasker
+from zhijian.metrics import DDCCalculator, InflationCalculator, LDRCalculator
+from zhijian.metrics.context_jargon import ContextJargonDetector
+from zhijian.metrics.docstring_inflation import DocstringInflationDetector
+from zhijian.metrics.hallucination_deps import HallucinationDepsDetector
+from zhijian.models import (
+    FileAnalysis,
+    IgnoredFunction,
+    MaskedIssue,
+    ProjectAnalysis,
+    SlopStatus,
+    SuppressionDirective,
+    SuppressionLedgerEntry,
+)
+from zhijian.patterns import get_all_patterns
+from zhijian.patterns.base import Issue
+from zhijian.patterns.registry import PatternRegistry
+from zhijian.prioritization import ProjectPrioritizer
+from zhijian.rust_scan import discover_project_files
+from zhijian.suppression_handler import SuppressionHandler
+
+logger = logging.getLogger(__name__)
+DEFAULT_EXCLUDE_PARTS = {
+    ".claude",
+    ".venv",
+    "venv",
+    "site-packages",
+    "node_modules",
+    "__pycache__",
+    ".git",
+    "build",
+    "dist",
+    ".tox",
+    ".next",
+    "htmlcov",
+}
+
+
+class _SkipProxy:
+    """Thin proxy that overrides specific metric attributes for role-based skip logic."""
+
+    def __init__(self, wrapped, **overrides):
+        self._wrapped = wrapped
+        self._overrides = overrides
+
+    def __getattr__(self, name: str):
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._wrapped, name)
+
+
+class SlopDetector:
+    """Main SLOP detection engine with v2.1 pattern support."""
+
+    def __init__(self, config_path: Optional[str] = None, model_path: Optional[str] = None):
+        """Initialize detector with config.
+
+        Args:
+            config_path: Path to .slopconfig.yaml (optional).
+            model_path:  Path to trained ML model .pkl (optional).
+                         Defaults to "models/slop_classifier.pkl" if not specified.
+                         ML scoring is silently disabled when the file is absent.
+        """
+        self.config = Config(config_path)
+        self.ldr_calc = LDRCalculator(self.config)
+        self.inflation_calc = InflationCalculator(self.config)
+        self.ddc_calc = DDCCalculator(self.config)
+        self.docstring_inflation_detector = DocstringInflationDetector(self.config)  # v2.2
+        self.hallucination_deps_detector = HallucinationDepsDetector(self.config)  # v2.2
+        self.context_jargon_detector = ContextJargonDetector(self.config)  # v2.2
+
+        # v2.1: Initialize pattern registry
+        self.pattern_registry = PatternRegistry()
+        self.pattern_registry.register_all(
+            get_all_patterns(
+                god_function_config=self.config.get_god_function_config(),
+                nested_complexity_config=self.config.get_nested_complexity_config(),
+                phantom_import_allowlist=self.config.get_phantom_import_allowlist(),
+            )
+        )
+        # Disable patterns from config
+        disabled = self.config.get("patterns.disabled", [])
+        for pattern_id in disabled:
+            self.pattern_registry.disable(pattern_id)
+
+        # v2.8.0: Optional ML scorer — loads silently, fails silently
+        from pathlib import Path as _Path
+
+        from zhijian.ml.scorer import MLScorer as _MLScorer
+
+        _mp = _Path(model_path) if model_path else _Path("models/slop_classifier.pkl")
+        self._ml_scorer = _MLScorer.from_model(_mp)
+
+        # Phase 3b: JS/TS analyzer (lazy — only instantiated when needed)
+        self._js_analyzer = None
+        # Phase 3c: Go analyzer (lazy — only instantiated when needed)
+        self._go_analyzer = None
+        self._analysis_cache = (
+            FileAnalysisCache(self.config.get_analysis_cache_db())
+            if self.config.use_analysis_cache()
+            else None
+        )
+        self.project_prioritizer = ProjectPrioritizer(self.config)
+
+    def _get_js_analyzer(self):
+        """Lazy-load JSAnalyzer (avoids import cost when not used)."""
+        if self._js_analyzer is None:
+            from zhijian.languages.js_analyzer import JSAnalyzer
+
+            self._js_analyzer = JSAnalyzer()
+        return self._js_analyzer
+
+    def _get_go_analyzer(self):
+        """Lazy-load GoAnalyzer (avoids import cost when not used)."""
+        if self._go_analyzer is None:
+            from zhijian.languages.go_analyzer import GoAnalyzer
+
+            self._go_analyzer = GoAnalyzer()
+        return self._go_analyzer
+
+    @staticmethod
+    def _compute_dcf(tree: ast.AST) -> Dict[str, float]:
+        """Compute DCF (Distributional Code Fingerprint) from a parsed AST.
+
+        Returns P(node_type | file) = count(node_type) / total_nodes.
+        Genuine probability distribution: values in [0,1], sum to 1.
+        Used for information-theoretic slop distance (CQMS Level 2).
+        """
+        counts = Counter(type(node).__name__ for node in ast.walk(tree))
+        total = sum(counts.values()) or 1
+        return {k: v / total for k, v in counts.items()}
+
+    def analyze_file(self, file_path: str) -> FileAnalysis:
+        """
+        Analyze a single Python file.
+
+        Improvements in v2.1:
+        - Pattern-based detection alongside metrics
+        - Hybrid scoring (metrics + patterns)
+        """
+        path_obj = Path(file_path).resolve()
+        file_path = str(path_obj)
+        logger.info(f"Analyzing: {file_path}")
+
+        stat = path_obj.stat()
+        try:
+            raw_bytes = path_obj.read_bytes()
+        except Exception as e:
+            logger.error(f"Failed to read {file_path}: {e}")
+            raise
+        content = raw_bytes.decode("utf-8", errors="ignore")
+        content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+        if self._analysis_cache is not None:
+            cached = self._analysis_cache.get(
+                file_path=file_path,
+                file_size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,
+                content_hash=content_hash,
+                config_fingerprint=fingerprint_config(self.config.config),
+                engine_version=CACHE_ENGINE_VERSION,
+            )
+            if cached is not None:
+                logger.debug("File analysis cache hit: %s", file_path)
+                return cached
+
+        # Parse AST once
+        try:
+            tree = ast.parse(content, filename=file_path)
+        except SyntaxError as e:
+            logger.warning(f"Syntax error in {file_path}: {e}")
+            # Return minimal analysis
+            return self._create_error_analysis(file_path, str(e))
+
+        result = self._build_file_analysis(file_path, content, tree)
+        if self._analysis_cache is not None:
+            self._analysis_cache.put(
+                file_path=file_path,
+                file_size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,
+                content_hash=content_hash,
+                config_fingerprint=fingerprint_config(self.config.config),
+                result=result,
+                engine_version=CACHE_ENGINE_VERSION,
+            )
+        return result
+
+    def analyze_code_string(self, content: str, filename: str = "<string>") -> FileAnalysis:
+        """Analyze Python source code provided as a string (no file I/O).
+
+        Identical to analyze_file() but accepts raw source instead of a path.
+        Useful for dataset pipelines, REPL usage, and API endpoints.
+
+        Args:
+            content:  Python source code as a string.
+            filename: Virtual filename shown in results (default: "<string>").
+
+        Returns:
+            FileAnalysis — same structure as analyze_file().
+        """
+        try:
+            tree = ast.parse(content, filename=filename)
+        except SyntaxError as e:
+            return self._create_error_analysis(filename, str(e))
+        return self._build_file_analysis(filename, content, tree)
+
+    def analyze_project(self, project_path: str, pattern: str = "**/*.py") -> ProjectAnalysis:
+        """
+        Analyze entire project with weighted scoring.
+
+        v2.0 improvements:
+        - Weighted by file size (LOC)
+        - Respects ignore patterns
+        - Parallel-ready architecture
+        """
+        project_path_obj = Path(project_path)
+        ignore_patterns = self.config.get_ignore_patterns()
+
+        # Find Python files
+        python_files = discover_project_files(project_path_obj, [pattern], ignore_patterns)
+        if python_files is None:
+            python_files = []
+            for file_path in project_path_obj.glob(pattern):
+                # Check ignore patterns
+                if self._should_ignore(file_path, ignore_patterns, root=project_path_obj):
+                    continue
+                python_files.append(file_path)
+        else:
+            python_files = [
+                file_path
+                for file_path in python_files
+                if not self._should_ignore(file_path, ignore_patterns, root=project_path_obj)
+            ]
+
+        logger.info(f"Found {len(python_files)} Python files in {project_path}")
+
+        # Analyze files
+        results: List[FileAnalysis] = []
+        for file_path in python_files:
+            try:
+                result = self.analyze_file(str(file_path))
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error analyzing {file_path}: {e}")
+
+        # Phase 3b: JS/TS analysis is independent of Python — run before early return
+        js_results = self._analyze_js_files(project_path_obj, ignore_patterns)
+        # Phase 3c: Go analysis is independent of Python — run before early return
+        go_results = self._analyze_go_files(project_path_obj, ignore_patterns)
+
+        all_results = results + js_results + go_results
+
+        if not all_results:
+            logger.warning("No files analyzed")
+            pa = self._create_empty_project_analysis(str(project_path))
+            pa.js_file_results = js_results
+            pa.go_file_results = go_results
+            return pa
+
+        # Calculate aggregated metrics
+        total_files = len(all_results)
+        slop_files = sum(1 for r in all_results if self._is_result_non_clean(r))
+        clean_files = total_files - slop_files
+
+        # Simple average for deficit score across all supported languages.
+        avg_deficit_score = sum(self._result_slop_score(r) for r in all_results) / total_files
+
+        # v2.8.0: SR9-inspired conservative LDR aggregation across all languages.
+        # Prevents bad files from being diluted by the average.
+        ldr_scores = [self._result_ldr_score(r) for r in all_results]
+        avg_ldr = 0.6 * min(ldr_scores) + 0.4 * (sum(ldr_scores) / total_files)
+        avg_inflation = sum(
+            r.inflation.inflation_score
+            for r in results
+            if math.isfinite(r.inflation.inflation_score)
+        ) / max(1, sum(1 for r in results if math.isfinite(r.inflation.inflation_score)))
+        avg_ddc = sum(r.ddc.usage_ratio for r in results) / max(1, len(results))
+
+        # Weighted average (by LOC)
+        if self.config.use_weighted_analysis():
+            total_loc = sum(self._result_total_lines(r) for r in all_results)
+            weighted_deficit_score = (
+                sum(
+                    self._result_slop_score(r) * (self._result_total_lines(r) / total_loc)
+                    for r in all_results
+                )
+                if total_loc > 0
+                else avg_deficit_score
+            )
+        else:
+            weighted_deficit_score = avg_deficit_score
+
+        # Determine overall status
+        if weighted_deficit_score >= 50:
+            overall_status = SlopStatus.CRITICAL_DEFICIT
+        elif weighted_deficit_score >= 30:
+            overall_status = SlopStatus.SUSPICIOUS
+        else:
+            overall_status = SlopStatus.CLEAN
+
+        # v3.0: VR structural coherence — MST H0 persistence over file DCFs
+        file_dcfs = [r.dcf for r in results if r.dcf]
+        structural_coherence, coherence_level = self._compute_coherence_vr(file_dcfs)
+        suppression_ledger = [
+            entry for result in results for entry in getattr(result, "suppression_ledger", [])
+        ]
+        priority_hotspots, churn_available, coverage_available = (
+            self.project_prioritizer.prioritize_project(str(project_path_obj), results)
+        )
+
+        return ProjectAnalysis(
+            project_path=str(project_path),
+            total_files=total_files,
+            deficit_files=slop_files,
+            clean_files=clean_files,
+            avg_deficit_score=avg_deficit_score,
+            weighted_deficit_score=weighted_deficit_score,
+            avg_ldr=avg_ldr,
+            avg_inflation=avg_inflation,
+            avg_ddc=avg_ddc,
+            overall_status=overall_status,
+            file_results=results,
+            structural_coherence=structural_coherence,
+            coherence_level=coherence_level,
+            suppressed_issue_count=len(suppression_ledger),
+            suppression_ledger=suppression_ledger,
+            priority_hotspots=priority_hotspots,
+            churn_analysis_available=churn_available,
+            coverage_analysis_available=coverage_available,
+            js_file_results=js_results,
+            go_file_results=go_results,
+        )
+
+    def _build_file_analysis(self, file_path: str, content: str, tree: ast.AST) -> FileAnalysis:
+        """Build a FileAnalysis from already-read source and parsed AST."""
+        from zhijian.file_role import ROLE_SKIP
+
+        role = classify_file(file_path, content, tree)  # type: ignore[arg-type]
+        skip = ROLE_SKIP[role]
+
+        ldr = self.ldr_calc.calculate(file_path, content, tree)
+        inflation = self.inflation_calc.calculate(file_path, content, tree)
+        ddc = self.ddc_calc.calculate(file_path, content, tree)
+        dcf = self._compute_dcf(tree)
+        docstring_inflation = self.docstring_inflation_detector.analyze(file_path, content, tree)
+        hallucination_deps = self.hallucination_deps_detector.analyze(file_path, content, tree, ddc)
+        context_jargon = self.context_jargon_detector.analyze(file_path, content, tree, inflation)
+        ignored_functions = IgnoreHandler.collect_ignored_functions(tree)
+        suppression_directives = SuppressionHandler.parse_comment_suppressions(content)
+        pattern_issues, suppression_ledger, masked_issues = (
+            ([], [], [])
+            if "patterns" in skip
+            else self._run_patterns(
+                tree,
+                Path(file_path),
+                content,
+                ignored_functions,
+                suppression_directives=suppression_directives,
+            )
+        )
+
+        slop_score, slop_status, warnings, deficit_breakdown = self._calculate_slop_status(
+            ldr, inflation, ddc, pattern_issues, skip=skip
+        )
+
+        result = FileAnalysis(
+            file_path=file_path,
+            ldr=ldr,
+            inflation=inflation,
+            ddc=ddc,
+            deficit_score=slop_score,
+            status=slop_status,
+            warnings=warnings,
+            pattern_issues=pattern_issues,
+            docstring_inflation=docstring_inflation,
+            hallucination_deps=hallucination_deps,
+            context_jargon=context_jargon,
+            ignored_functions=ignored_functions,
+            suppression_directives=suppression_directives,
+            suppression_ledger=suppression_ledger,
+            masked_issues=masked_issues,
+            dcf=dcf,
+            deficit_breakdown=deficit_breakdown,
+        )
+
+        if len(suppression_ledger) >= 5 or len(suppression_directives) >= 3:
+            result.warnings.append(
+                "SUPPRESSIONS: high inline suppression usage — review whether rules should be fixed or narrowed"
+            )
+
+        if self._ml_scorer is not None:
+            result.ml_score = self._ml_scorer.score(result)
+
+        return result
+
+    _JS_EXTENSIONS = frozenset({".js", ".jsx", ".ts", ".tsx"})
+
+    def _analyze_js_files(self, project_path_obj: Path, ignore_patterns: List[str]) -> List:
+        """Scan and analyze JS/TS files in project_path_obj (Phase 3b)."""
+        discovered = discover_project_files(
+            project_path_obj,
+            [f"**/*{ext}" for ext in self._JS_EXTENSIONS],
+            ignore_patterns,
+        )
+        if discovered is None:
+            js_files = [
+                fp
+                for fp in project_path_obj.rglob("*")
+                if fp.suffix.lower() in self._JS_EXTENSIONS
+                and not self._should_ignore(fp, ignore_patterns, root=project_path_obj)
+            ]
+        else:
+            js_files = [fp for fp in discovered if fp.suffix.lower() in self._JS_EXTENSIONS]
+        if not js_files:
+            return []
+        analyzer = self._get_js_analyzer()
+        results = []
+        for fp in js_files:
+            try:
+                results.append(analyzer.analyze(str(fp)))
+            except Exception as exc:
+                logger.error(f"Error analyzing JS/TS file {fp}: {exc}")
+        logger.info(f"Analyzed {len(results)} JS/TS files")
+        return results
+
+    def analyze_js_file(self, file_path: str):
+        """Analyze a single JS/TS file and return JSFileAnalysis."""
+        return self._get_js_analyzer().analyze(file_path)
+
+    _GO_EXTENSIONS = frozenset({".go"})
+
+    def _analyze_go_files(self, project_path_obj: Path, ignore_patterns: List[str]) -> List:
+        """Scan and analyze Go files in project_path_obj (Phase 3c)."""
+        discovered = discover_project_files(
+            project_path_obj,
+            [f"**/*{ext}" for ext in self._GO_EXTENSIONS],
+            ignore_patterns,
+        )
+        if discovered is None:
+            go_files = [
+                fp
+                for fp in project_path_obj.rglob("*")
+                if fp.suffix.lower() in self._GO_EXTENSIONS
+                and not self._should_ignore(fp, ignore_patterns, root=project_path_obj)
+            ]
+        else:
+            go_files = [fp for fp in discovered if fp.suffix.lower() in self._GO_EXTENSIONS]
+        if not go_files:
+            return []
+        analyzer = self._get_go_analyzer()
+        results = []
+        for fp in go_files:
+            try:
+                results.append(analyzer.analyze(str(fp)))
+            except Exception as exc:
+                logger.error(f"Error analyzing Go file {fp}: {exc}")
+        logger.info(f"Analyzed {len(results)} Go files")
+        return results
+
+    def analyze_go_file(self, file_path: str):
+        """Analyze a single .go file and return GoFileAnalysis."""
+        return self._get_go_analyzer().analyze(file_path)
+
+    def _run_patterns(
+        self,
+        tree: ast.AST,
+        file: Path,
+        content: str,
+        ignored_functions: Optional[List[IgnoredFunction]] = None,
+        suppression_directives: Optional[List[SuppressionDirective]] = None,
+    ) -> tuple[List[Issue], List[SuppressionLedgerEntry], List[MaskedIssue]]:
+        """
+        Run all enabled patterns on the file.
+
+        v2.1: New pattern-based detection.
+        v2.6.3: Filters issues from @slop.ignore decorated functions.
+        """
+        issues = []
+        suppression_ledger: List[SuppressionLedgerEntry] = []
+        masked_issues: List[MaskedIssue] = []
+        ignored_functions = ignored_functions or []
+        suppression_directives = suppression_directives or []
+        ignored_ranges = IgnoreHandler.get_ignored_line_ranges(tree, ignored_functions)
+
+        for pattern in self.pattern_registry.get_all():
+            try:
+                pattern_issues = pattern.check(tree, file, content)
+                pattern_issues, pattern_masked = FrameworkMasker.apply_python_masking(
+                    file, content, tree, pattern_issues
+                )
+                masked_issues.extend(pattern_masked)
+                # v2.6.3: Filter issues in ignored functions
+                for issue in pattern_issues:
+                    if IgnoreHandler.is_line_in_ignored_range(issue.line, ignored_ranges):
+                        continue
+                    ledger_entry = SuppressionHandler.match_issue(
+                        str(file), issue.line, pattern.id, suppression_directives
+                    )
+                    if ledger_entry is not None:
+                        suppression_ledger.append(ledger_entry)
+                        continue
+                    issues.append(issue)
+            except Exception as e:
+                logger.warning(f"Pattern {pattern.id} failed: {e}")
+
+        return issues, suppression_ledger, masked_issues
+
+    # Backward-compat shims — delegate to IgnoreHandler
+    def _collect_ignored_functions(self, tree: ast.AST) -> List[IgnoredFunction]:
+        return IgnoreHandler.collect_ignored_functions(tree)
+
+    def _get_ignored_line_ranges(
+        self, tree: ast.AST, ignored_functions: List[IgnoredFunction]
+    ) -> List[tuple]:
+        return IgnoreHandler.get_ignored_line_ranges(tree, ignored_functions)
+
+    def _is_line_in_ignored_range(self, line: int, ranges: List[tuple]) -> bool:
+        return IgnoreHandler.is_line_in_ignored_range(line, ranges)
+
+    def _compute_gqg(self, ldr, inflation_normalized: float, ddc, purity: float) -> float:
+        """Geometric quality gate — weighted geometric mean of four dimensions.
+
+        Formula: exp(sum(w_i * ln(max(1e-4, v_i))) / sum(w_i))
+        Dimensions: ldr_score, 1-inflation_normalized, ddc.usage_ratio, purity.
+        """
+        weights = self.config.get_weights()
+        w_ldr = weights.get("ldr", 0.40)
+        w_inf = weights.get("inflation", 0.30)
+        w_ddc = weights.get("ddc", 0.20)
+        w_pur = weights.get("purity", 0.10)
+        total_w = w_ldr + w_inf + w_ddc + w_pur
+        return exp(
+            (
+                w_ldr * log(max(1e-4, ldr.ldr_score))
+                + w_inf * log(max(1e-4, 1.0 - inflation_normalized))
+                + w_ddc * log(max(1e-4, ddc.usage_ratio))
+                + w_pur * log(max(1e-4, purity))
+            )
+            / total_w
+        )
+
+    @staticmethod
+    def _build_metric_warnings(ldr, inflation, ddc, skip: frozenset = frozenset()) -> List[str]:
+        """Generate per-metric threshold warnings for ldr, inflation, and ddc."""
+        warnings: List[str] = []
+        if "ldr" not in skip:
+            if ldr.ldr_score < 0.30:
+                warnings.append(f"CRITICAL: Logic density only {ldr.ldr_score:.2%}")
+            elif ldr.ldr_score < 0.60:
+                warnings.append(f"WARNING: Low logic density {ldr.ldr_score:.2%}")
+        if "inflation" not in skip:
+            if inflation.inflation_score > 1.0:
+                warnings.append(f"CRITICAL: Inflation ratio {inflation.inflation_score:.2f}")
+            elif inflation.inflation_score > 0.5:
+                warnings.append(f"WARNING: High inflation ratio {inflation.inflation_score:.2f}")
+        if "ddc" not in skip:
+            if ddc.usage_ratio < 0.50:
+                warnings.append(f"CRITICAL: Only {ddc.usage_ratio:.2%} of imports used")
+            elif ddc.usage_ratio < 0.70:
+                warnings.append(f"WARNING: Low import usage {ddc.usage_ratio:.2%}")
+            if ddc.fake_imports:
+                warnings.append(f"FAKE IMPORTS: {', '.join(ddc.fake_imports)}")
+        return warnings
+
+    def _calculate_slop_status(
+        self,
+        ldr,
+        inflation,
+        ddc,
+        pattern_issues: Optional[List[Issue]] = None,
+        skip: frozenset = frozenset(),
+    ) -> tuple[float, SlopStatus, List[str], Dict[str, float]]:
+        """
+        Calculate slop score using weighted formula + pattern penalties.
+
+        v2.1: Includes pattern-based scoring.
+        v3.3.0: ``skip`` frozenset suppresses specific checks for file roles
+                (e.g. INIT files skip 'ldr' and 'ddc').
+        v3.7.6 (SLOP-003): also returns deficit_breakdown — per-dimension
+                penalty attribution so a non-zero score on a "clean" file
+                can be explained without reading raw findings.
+        """
+        pattern_issues = pattern_issues or []
+
+        # Normalize Inflation (cap at 2.0, treat inf as 2.0)
+        inflation_normalized = (
+            min(inflation.inflation_score, 2.0) / 2.0
+            if inflation.inflation_score != float("inf")
+            else 1.0
+        )
+        if "inflation" in skip:
+            inflation_normalized = 0.0  # treat as perfect
+
+        # purity = exp(-0.5 * n_critical): GQG AND-gate dimension for pattern severity
+        n_critical = len([i for i in pattern_issues if i.severity.value == "critical"])
+        purity = exp(-0.5 * n_critical)
+
+        # Build effective ldr/ddc scores respecting skip
+        effective_ldr = _SkipProxy(ldr, ldr_score=1.0) if "ldr" in skip else ldr
+        effective_ddc = _SkipProxy(ddc, usage_ratio=1.0) if "ddc" in skip else ddc
+
+        gqg = self._compute_gqg(effective_ldr, inflation_normalized, effective_ddc, purity)
+        base_deficit_score = 100 * (1 - gqg)
+        pattern_penalty = self._calculate_pattern_penalty(pattern_issues)
+        deficit_score = min(base_deficit_score + pattern_penalty, 100.0)
+
+        deficit_breakdown = self._compute_deficit_breakdown(
+            effective_ldr,
+            inflation_normalized,
+            effective_ddc,
+            purity,
+            base_deficit_score,
+            pattern_penalty,
+            deficit_score,
+        )
+
+        warnings = self._build_metric_warnings(ldr, inflation, ddc, skip=skip)
+
+        # v2.1: Add pattern warnings
+        critical_patterns = [i for i in pattern_issues if i.severity.value == "critical"]
+        high_patterns = [i for i in pattern_issues if i.severity.value == "high"]
+
+        if critical_patterns:
+            warnings.append(f"PATTERNS: {len(critical_patterns)} critical issues found")
+        if high_patterns:
+            warnings.append(f"PATTERNS: {len(high_patterns)} high-severity issues found")
+
+        # v2.8.0: Monotonic single-axis status determination (TOE gate principle)
+        # Primary axis: deficit_score is the authoritative measure.
+        # Supplementary overrides are explicit, documented, and threshold-gated.
+        if deficit_score >= 70:
+            status = SlopStatus.CRITICAL_DEFICIT
+        elif deficit_score >= 50:
+            status = SlopStatus.INFLATED_SIGNAL
+        elif deficit_score >= 30:
+            status = SlopStatus.SUSPICIOUS
+        else:
+            status = SlopStatus.CLEAN
+
+        # Supplementary override 1: extreme critical pattern density
+        # 5+ critical patterns is unambiguous slop regardless of score
+        if len(critical_patterns) >= 5 and status == SlopStatus.CLEAN:
+            status = SlopStatus.SUSPICIOUS
+
+        # Supplementary override 2: near-zero import usage (structural issue)
+        # DEPENDENCY_NOISE applies when DDC < 20% is the *primary* failure mode.
+        # GQG collapses on near-zero DDC, but the label should reflect root cause.
+        # Guard: skip if critical patterns, high inflation, or role-based DDC skip.
+        if (
+            ddc.usage_ratio < 0.20
+            and "ddc" not in skip
+            and not critical_patterns
+            and inflation.inflation_score <= 1.0
+        ):
+            status = SlopStatus.DEPENDENCY_NOISE
+
+        return deficit_score, status, warnings, deficit_breakdown
+
+    def _compute_deficit_breakdown(
+        self,
+        ldr,
+        inflation_normalized: float,
+        ddc,
+        purity: float,
+        base_deficit_score: float,
+        pattern_penalty: float,
+        deficit_score: float,
+    ) -> Dict[str, float]:
+        """Attribute deficit_score to its source dimensions (SLOP-003).
+
+        The GQG geometric mean cannot be decomposed linearly, but we can
+        attribute the *log loss* contribution of each dimension and then
+        scale to the realised base_deficit_score. The fields sum to total
+        within 0.01 (when not capped at 100) — see test_deficit_breakdown.
+
+        Returns absolute "points-of-deficit" per dimension, plus the
+        pattern_penalty actually applied (post-cap, post-floor).
+        """
+        weights = self.config.get_weights()
+        w_ldr = weights.get("ldr", 0.40)
+        w_inf = weights.get("inflation", 0.30)
+        w_ddc = weights.get("ddc", 0.20)
+        w_pur = weights.get("purity", 0.10)
+        total_w = w_ldr + w_inf + w_ddc + w_pur
+
+        # Log-loss per dimension (negative since values are in (0,1]).
+        # Matches the same clamp used in _compute_gqg.
+        ldr_loss = -w_ldr * log(max(1e-4, ldr.ldr_score))
+        inf_loss = -w_inf * log(max(1e-4, 1.0 - inflation_normalized))
+        ddc_loss = -w_ddc * log(max(1e-4, ddc.usage_ratio))
+        pur_loss = -w_pur * log(max(1e-4, purity))
+        total_loss = (ldr_loss + inf_loss + ddc_loss + pur_loss) / total_w
+
+        # Share-based attribution: distributes base_deficit_score across
+        # dimensions in proportion to each one's log-loss share.
+        if total_loss > 1e-9:
+            ldr_share = (ldr_loss / total_w) / total_loss
+            inf_share = (inf_loss / total_w) / total_loss
+            ddc_share = (ddc_loss / total_w) / total_loss
+            pur_share = (pur_loss / total_w) / total_loss
+        else:
+            ldr_share = inf_share = ddc_share = pur_share = 0.0
+
+        # Effective pattern contribution after the 100-cap on total.
+        # When base + pattern_penalty <= 100, pattern_hits == pattern_penalty.
+        # When capped, the cap eats into the pattern contribution first.
+        effective_pattern = max(0.0, deficit_score - base_deficit_score)
+
+        return {
+            "ldr_penalty": round(ldr_share * base_deficit_score, 4),
+            "inflation_penalty": round(inf_share * base_deficit_score, 4),
+            "ddc_penalty": round(ddc_share * base_deficit_score, 4),
+            "purity_penalty": round(pur_share * base_deficit_score, 4),
+            "pattern_hits": round(effective_pattern, 4),
+            "total": round(deficit_score, 4),
+        }
+
+    def _js_divergence(self, p: List[float], q: List[float]) -> float:
+        """Jensen-Shannon divergence between two probability vectors.
+
+        Returns JSD in [0, 1] (log base 2 convention, then normalized to [0,1]).
+        Both p and q must have equal length and sum to ~1.
+        """
+        m = [(pi + qi) / 2.0 for pi, qi in zip(p, q)]
+        eps = 1e-12
+
+        def kl(a: List[float], b: List[float]) -> float:
+            return sum(ai * log(ai / bi) for ai, bi in zip(a, b) if ai > eps and bi > eps)
+
+        jsd = 0.5 * kl(p, m) + 0.5 * kl(q, m)
+        return max(0.0, min(1.0, jsd))
+
+    @staticmethod
+    def _deterministic_sample_indices(total: int, sample_size: int) -> List[int]:
+        """Pick a stable spread of indices across an ordered sequence."""
+        if sample_size >= total:
+            return list(range(total))
+        if sample_size <= 1:
+            return [0]
+
+        last = total - 1
+        raw = [round(i * last / (sample_size - 1)) for i in range(sample_size)]
+        indices: List[int] = []
+        seen = set()
+
+        for idx in raw:
+            candidate = int(idx)
+            while candidate in seen and candidate < total - 1:
+                candidate += 1
+            while candidate in seen and candidate > 0:
+                candidate -= 1
+            if candidate not in seen:
+                indices.append(candidate)
+                seen.add(candidate)
+
+        for candidate in range(total):
+            if len(indices) >= sample_size:
+                break
+            if candidate not in seen:
+                indices.append(candidate)
+                seen.add(candidate)
+
+        return sorted(indices)
+
+    def _compute_coherence_vr_exact(self, file_dcfs: Sequence[Dict[str, float]]) -> float:
+        """MST H0 persistent homology coherence over file DCFs.
+
+        coherence = 1 - max_mst_edge
+        where max_mst_edge is the longest edge in the minimum spanning tree
+        of pairwise sqrt-JSD distances between file DCFs.
+
+        Properties:
+        - epsilon-free (no threshold parameter)
+        - 1.0: all files structurally uniform
+        - 0.0: maximally distinct structural clusters
+        - Equivalent to maximum H0 persistence in the Vietoris-Rips filtration
+        """
+        n = len(file_dcfs)
+        if n <= 1:
+            return 1.0
+
+        # Build pairwise sqrt-JSD distance matrix
+        dist = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                all_keys = sorted(set(file_dcfs[i]) | set(file_dcfs[j]))
+                p = [file_dcfs[i].get(k, 0.0) for k in all_keys]
+                q = [file_dcfs[j].get(k, 0.0) for k in all_keys]
+                jsd = self._js_divergence(p, q)
+                d = sqrt(jsd)
+                dist[i][j] = dist[j][i] = d
+
+        # Prim's MST — O(n^2), ε-free
+        in_mst = [False] * n
+        min_edge = [float("inf")] * n
+        min_edge[0] = 0.0
+        mst_edge_weights: List[float] = []
+
+        for _ in range(n):
+            u = min((v for v in range(n) if not in_mst[v]), key=lambda v: min_edge[v])
+            in_mst[u] = True
+            if min_edge[u] > 0.0:
+                mst_edge_weights.append(min_edge[u])
+            for v in range(n):
+                if not in_mst[v] and dist[u][v] < min_edge[v]:
+                    min_edge[v] = dist[u][v]
+
+        max_persistence = max(mst_edge_weights) if mst_edge_weights else 0.0
+        return max(0.0, 1.0 - max_persistence)
+
+    def _compute_coherence_vr(self, file_dcfs: List[Dict[str, float]]) -> tuple[float, str]:
+        """Compute structural coherence with an exact ceiling and deterministic fallback."""
+        n = len(file_dcfs)
+        if n <= 1:
+            return 1.0, "none"
+
+        exact_ceiling = self.config.get_exact_topology_ceiling()
+        mode = self.config.get_topology_mode_above_ceiling()
+
+        if n <= exact_ceiling or mode == "exact":
+            return self._compute_coherence_vr_exact(file_dcfs), "vr_structural"
+
+        sample_indices = self._deterministic_sample_indices(n, exact_ceiling)
+        sampled_dcfs = [file_dcfs[idx] for idx in sample_indices]
+        return self._compute_coherence_vr_exact(sampled_dcfs), "vr_structural_approx"
+
+    def _calculate_pattern_penalty(self, issues: List[Issue]) -> float:
+        """
+        Calculate penalty from pattern issues.
+
+        v2.1: Pattern-based scoring.
+        """
+        severity_weights = {
+            "critical": 10.0,
+            "high": 5.0,
+            "medium": 2.0,
+            "low": 1.0,
+        }
+
+        penalty = 0.0
+        for issue in issues:
+            weight = severity_weights.get(issue.severity.value, 1.0)
+            penalty += weight
+
+        # Cap pattern penalty at 50 points
+        return min(penalty, 50.0)
+
+    @staticmethod
+    def _result_status_value(result: Any) -> str:
+        status = getattr(result, "status", SlopStatus.CLEAN)
+        return status.value if isinstance(status, SlopStatus) else str(status)
+
+    def _is_result_non_clean(self, result: Any) -> bool:
+        return self._result_status_value(result) != SlopStatus.CLEAN.value
+
+    @staticmethod
+    def _result_slop_score(result: Any) -> float:
+        if hasattr(result, "deficit_score"):
+            return float(result.deficit_score)
+        return float(getattr(result, "slop_score", 0.0))
+
+    @staticmethod
+    def _result_total_lines(result: Any) -> int:
+        if hasattr(result, "ldr"):
+            return int(getattr(result.ldr, "total_lines", 0))
+        return int(getattr(result, "total_lines", 0))
+
+    @staticmethod
+    def _result_ldr_score(result: Any) -> float:
+        if hasattr(result, "ldr"):
+            return float(getattr(result.ldr, "ldr_score", 0.0))
+        return float(getattr(result, "ldr_equivalent", 0.0))
+
+    def _should_ignore(
+        self, file_path: Path, patterns: List[str], root: Optional[Path] = None
+    ) -> bool:
+        """Check if file matches any ignore pattern."""
+        lowered_parts = {part.lower() for part in file_path.parts}
+        if lowered_parts & DEFAULT_EXCLUDE_PARTS:
+            return True
+
+        normalized_paths = set()
+        if root is not None:
+            try:
+                normalized_paths.add(str(file_path.relative_to(root)).replace("\\", "/"))
+            except ValueError:
+                normalized_paths.add(str(file_path).replace("\\", "/"))
+        else:
+            normalized_paths.add(str(file_path).replace("\\", "/"))
+        for pattern in patterns:
+            pat = str(pattern).replace("\\", "/")
+            for normalized in normalized_paths:
+                if Path(normalized).match(pat):
+                    return True
+                if fnmatch.fnmatch(normalized, pat):
+                    return True
+                if pat.startswith("**/") and fnmatch.fnmatch(normalized, pat[3:]):
+                    return True
+        return False
+
+    def _create_error_analysis(self, file_path: str, error: str) -> FileAnalysis:
+        """Create minimal analysis for files with errors."""
+        from zhijian.models import DDCResult, InflationResult, LDRResult
+
+        # 999.0 sentinel instead of float("inf") — inf serializes as "Infinity"
+        # which violates RFC 8259 and is rejected by jq/most JSON parsers.
+        return FileAnalysis(
+            file_path=file_path,
+            ldr=LDRResult(0, 0, 0, 0.0, "N/A"),
+            inflation=InflationResult(0, 0.0, 999.0, "error", []),
+            ddc=DDCResult([], [], [], [], [], 0.0, "N/A"),
+            deficit_score=100.0,  # CRITICAL: Syntax errors are severe
+            status=SlopStatus.CRITICAL_DEFICIT,
+            warnings=[f"Parse error: {error}"],
+        )
+
+    def _create_empty_project_analysis(self, project_path: str) -> ProjectAnalysis:
+        """Create empty project analysis."""
+        return ProjectAnalysis(
+            project_path=project_path,
+            total_files=0,
+            deficit_files=0,
+            clean_files=0,
+            avg_deficit_score=0.0,
+            weighted_deficit_score=0.0,
+            avg_ldr=0.0,
+            avg_inflation=0.0,
+            avg_ddc=0.0,
+            overall_status=SlopStatus.CLEAN,
+            file_results=[],
+            suppressed_issue_count=0,
+            suppression_ledger=[],
+            priority_hotspots=[],
+            churn_analysis_available=False,
+            coverage_analysis_available=False,
+        )
