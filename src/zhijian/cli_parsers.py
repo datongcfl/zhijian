@@ -20,7 +20,8 @@ Examples:
   zhijian file.py                      # 扫描单个文件
   zhijian --severity high              # 只看高严重度问题
   zhijian --json                       # JSON 输出
-  zhijian --output report.json         # 导出报告
+  zhijian --report report.md           # 生成 Markdown 报告
+  zhijian --output report.json         # 导出 JSON 报告
   zhijian --ci                         # CI 模式
   zhijian --list-patterns              # 列出所有检测规则
   zhijian --disable redundant_comment  # 禁用特定规则
@@ -38,9 +39,14 @@ Examples:
     parser.add_argument("--output", "-o", help="Output file (txt, json, or html)")
     parser.add_argument("--json", action="store_true", help="Output JSON format")
     parser.add_argument(
+        "--report",
+        metavar="PATH",
+        help="Generate Markdown report to specified file (e.g., --report report.md)",
+    )
+    parser.add_argument(
         "--format",
-        choices=["json"],
-        help="Structured output format alias (currently supports: json)",
+        choices=["json", "md"],
+        help="Structured output format alias (json or md)",
     )
     parser.add_argument("--config", "-c", help="Path to .slopconfig.yaml configuration file")
     parser.add_argument(

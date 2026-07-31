@@ -238,6 +238,43 @@ def _emit_leda_yaml(args, result) -> None:
     print(f"[+] LEDA injection YAML saved to {written}")
 
 
+def _serialize_value(v):
+    """递归序列化单个值。"""
+    if isinstance(v, enum.Enum):
+        return v.value
+    if isinstance(v, dict):
+        return {str(kk): _serialize_value(vv) for kk, vv in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_serialize_value(item) for item in v]
+    if hasattr(v, "to_dict"):
+        return v.to_dict()
+    if hasattr(v, "__dict__"):
+        return _serialize_obj(v)
+    return v
+
+
+def _serialize_obj(obj) -> dict:
+    """将对象转换为可序列化的字典。"""
+    data = {}
+    for k, v in obj.__dict__.items():
+        if k.startswith("_"):
+            continue
+        data[k] = _serialize_value(v)
+    return data
+
+
+def _result_to_dict(result) -> dict:
+    """将 FileAnalysis/ProjectAnalysis 转换为字典格式。"""
+    if isinstance(result, dict):
+        return result
+    if hasattr(result, "__dict__"):
+        return _serialize_obj(result)
+    return {"result": str(result)}
+
+
+import enum  # noqa: E402
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
     argv_list = list(sys.argv[1:] if argv is None else argv)
@@ -327,6 +364,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return ci_exit
 
     _handle_output(args, result)
+
+    # 生成 Markdown 报告
+    if getattr(args, "report", None):
+        from zhijian.report_generator import save_report
+
+        try:
+            report_data = result if isinstance(result, dict) else _result_to_dict(result)
+            project_name = Path(args.path).name
+            saved = save_report(report_data, args.report, project_name)
+            print(f"[+] Markdown 报告已保存: {saved}")
+        except Exception as e:
+            print(f"[!] 报告生成失败: {e}", file=sys.stderr)
 
     if getattr(args, "emit_leda_yaml", False):
         _emit_leda_yaml(args, result)
