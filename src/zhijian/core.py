@@ -51,6 +51,9 @@ DEFAULT_EXCLUDE_PARTS = {
     ".tox",
     ".next",
     "htmlcov",
+    "VERSION_RECORDS",  # 旧版本快照
+    "backups",  # 备份目录
+    "_archive",  # 归档目录
 }
 
 

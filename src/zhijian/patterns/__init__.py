@@ -81,6 +81,9 @@ def get_all_patterns(
     from zhijian.patterns.style import STYLE_PATTERNS
     from zhijian.patterns.assumption import ASSUMPTION_PATTERNS
 
+    # === 智检新增的安全检测模式 ===
+    from zhijian.patterns.security import SECURITY_PATTERNS
+
     return [
         # Structural (Critical/High) - 来自 AI-SLOP-Detector
         BareExceptPattern(),
@@ -131,4 +134,6 @@ def get_all_patterns(
         *STYLE_PATTERNS,
         # 假设检测 (Assumption) - 1 个
         *ASSUMPTION_PATTERNS,
+        # === 安全检测 (Security) - 2 个，智检新增 ===
+        *SECURITY_PATTERNS,
     ]
