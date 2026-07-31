@@ -95,18 +95,18 @@ if [ -z "$STAGED_FILES" ]; then
     exit 0
 fi
 
-# Run slop detector with history recording
-slop-detector --files $STAGED_FILES --record-history --fail-on regression
+# Run zhijian on staged files
+zhijian $STAGED_FILES --fail-threshold 50
 
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
-    echo "[-] Slop detection failed! Fix issues before committing."
-    echo "    Run: slop-detector <file> --verbose for details"
+    echo "[-] Code quality check failed! Fix issues before committing."
+    echo "    Run: zhijian <file> --verbose for details"
     exit 1
 fi
 
-echo "[+] Slop detection passed!"
+echo "[+] Code quality check passed!"
 exit 0
 """
 

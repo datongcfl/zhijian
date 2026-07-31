@@ -34,7 +34,30 @@ from zhijian.models import (
 from zhijian.patterns.base import Axis, Issue, Severity
 
 CACHE_ENGINE_VERSION = "analysis-cache-v8"
-DEFAULT_CACHE_DB = Path.home() / ".zhijian" / "analysis_cache.db"
+
+
+def _get_default_cache_db() -> Path:
+    """获取默认缓存路径，权限受限时回退到临时目录。"""
+    import os
+    import tempfile
+
+    # 优先使用用户目录
+    home_cache = Path.home() / ".zhijian" / "analysis_cache.db"
+    try:
+        home_cache.parent.mkdir(parents=True, exist_ok=True)
+        # 测试写入权限
+        test_file = home_cache.parent / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+        return home_cache
+    except (PermissionError, OSError):
+        # 回退到临时目录
+        tmp_dir = Path(tempfile.gettempdir()) / "zhijian"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        return tmp_dir / "analysis_cache.db"
+
+
+DEFAULT_CACHE_DB = _get_default_cache_db()
 
 
 class FileAnalysisCache:
@@ -42,7 +65,11 @@ class FileAnalysisCache:
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db_path = Path(db_path) if db_path else DEFAULT_CACHE_DB
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            # 如果指定路径不可写，回退到默认路径
+            self.db_path = DEFAULT_CACHE_DB
         self._init_db()
 
     @contextmanager

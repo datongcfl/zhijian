@@ -2,6 +2,7 @@
 
 import logging as _logging
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -177,7 +178,7 @@ class Config:
 
     def __init__(self, config_path: Optional[str] = None):
         """Initialize config from file or use defaults."""
-        self.config: Dict[str, Any] = self.DEFAULT_CONFIG.copy()
+        self.config: Dict[str, Any] = deepcopy(self.DEFAULT_CONFIG)
 
         # Try loading from environment variable
         env_config = os.getenv("SLOP_CONFIG")

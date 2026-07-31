@@ -116,11 +116,13 @@ class SlopDetector:
         self._js_analyzer = None
         # Phase 3c: Go analyzer (lazy — only instantiated when needed)
         self._go_analyzer = None
-        self._analysis_cache = (
-            FileAnalysisCache(self.config.get_analysis_cache_db())
-            if self.config.use_analysis_cache()
-            else None
-        )
+        self._analysis_cache = None
+        if self.config.use_analysis_cache():
+            try:
+                self._analysis_cache = FileAnalysisCache(self.config.get_analysis_cache_db())
+            except Exception as exc:  # noqa: BLE001
+                # @ASSUMPTION: Cache is an optimization; analysis must remain authoritative without it.
+                logger.warning("Analysis cache disabled: %s", exc)
         self.project_prioritizer = ProjectPrioritizer(self.config)
 
     def _get_js_analyzer(self):
@@ -173,17 +175,21 @@ class SlopDetector:
         content_hash = hashlib.sha256(raw_bytes).hexdigest()
 
         if self._analysis_cache is not None:
-            cached = self._analysis_cache.get(
-                file_path=file_path,
-                file_size=stat.st_size,
-                mtime_ns=stat.st_mtime_ns,
-                content_hash=content_hash,
-                config_fingerprint=fingerprint_config(self.config.config),
-                engine_version=CACHE_ENGINE_VERSION,
-            )
-            if cached is not None:
-                logger.debug("File analysis cache hit: %s", file_path)
-                return cached
+            try:
+                cached = self._analysis_cache.get(
+                    file_path=file_path,
+                    file_size=stat.st_size,
+                    mtime_ns=stat.st_mtime_ns,
+                    content_hash=content_hash,
+                    config_fingerprint=fingerprint_config(self.config.config),
+                    engine_version=CACHE_ENGINE_VERSION,
+                )
+                if cached is not None:
+                    logger.debug("File analysis cache hit: %s", file_path)
+                    return cached
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Analysis cache read failed; disabling cache: %s", exc)
+                self._analysis_cache = None
 
         # Parse AST once
         try:
@@ -195,15 +201,19 @@ class SlopDetector:
 
         result = self._build_file_analysis(file_path, content, tree)
         if self._analysis_cache is not None:
-            self._analysis_cache.put(
-                file_path=file_path,
-                file_size=stat.st_size,
-                mtime_ns=stat.st_mtime_ns,
-                content_hash=content_hash,
-                config_fingerprint=fingerprint_config(self.config.config),
-                result=result,
-                engine_version=CACHE_ENGINE_VERSION,
-            )
+            try:
+                self._analysis_cache.put(
+                    file_path=file_path,
+                    file_size=stat.st_size,
+                    mtime_ns=stat.st_mtime_ns,
+                    content_hash=content_hash,
+                    config_fingerprint=fingerprint_config(self.config.config),
+                    result=result,
+                    engine_version=CACHE_ENGINE_VERSION,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Analysis cache write failed; disabling cache: %s", exc)
+                self._analysis_cache = None
         return result
 
     def analyze_code_string(self, content: str, filename: str = "<string>") -> FileAnalysis:
