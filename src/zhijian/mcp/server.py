@@ -16,13 +16,23 @@ import json
 import sys
 from pathlib import Path
 
+MAX_REPORT_CHARS = 1_000_000  # 输出大小防护：扫描报告超 100 万字符即截断（MCP 响应瞬时，不落盘）
+
+
+def _cap_text(text: str, max_chars: int = MAX_REPORT_CHARS) -> str:
+    """输出大小防护：超限截断并加标记，防止大目录扫描结果撑爆 MCP 客户端内存。"""
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars].rstrip()
+    marker = f"\n...(truncated: total {len(text)} chars, kept {max_chars})"
+    return head + marker
+
 
 def run_stdio_server() -> int:
     """启动 MCP stdio 服务。
 
     实现基本的 JSON-RPC 2.0 协议，支持以下工具:
-    - zhijian.scan: 扫描文件或目录
-    - zhijian.scan_file: 扫描单个文件
+    - zhijian.scan: 扫描文件或目录（path 为必填；输出带大小上限防护，防大目录扫描撑爆 MCP 响应）
     - zhijian.list_patterns: 列出所有检测规则
     """
     from zhijian.core import SlopDetector
@@ -82,9 +92,10 @@ def run_stdio_server() -> int:
                         result_data = d.analyze_project(path)
                     else:
                         result_data = d.analyze_file(path)
-                    # 转换为可序列化的字典
+                    # 输出大小防护：大目录扫描结果可能极大，截断防 MCP 客户端内存膨胀
                     from zhijian.cli import _result_to_dict
-                    result = {"content": [{"type": "text", "text": json.dumps(_result_to_dict(result_data), ensure_ascii=False, indent=2)}]}
+                    text = json.dumps(_result_to_dict(result_data), ensure_ascii=False, indent=2)
+                    result = {"content": [{"type": "text", "text": _cap_text(text)}]}
                 elif tool_name == "zhijian.list_patterns":
                     patterns = get_all_patterns()
                     pattern_list = [
