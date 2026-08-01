@@ -14,10 +14,10 @@ from typing import Any, Dict, Optional
 
 
 def _telemetry_home() -> Path:
-    override = os.getenv("AI_SLOP_DETECTOR_HOME")
+    override = os.getenv("ZHIJIAN_HOME") or os.getenv("AI_SLOP_DETECTOR_HOME")
     if override:
         return Path(override)
-    return Path.home() / ".slop-detector"
+    return Path.home() / ".zhijian"
 
 
 def _utc_now() -> str:

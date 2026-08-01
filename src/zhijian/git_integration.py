@@ -83,35 +83,13 @@ class GitIntegration:
         hook_path = hooks_dir / "pre-commit"
 
         hook_content = """#!/bin/sh
-# AI SLOP Detector Pre-Commit Hook
+# Zhijian Pre-Commit Hook
 
-echo "[*] Running AI SLOP Detector on staged files..."
-
-# Get staged Python files
-STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\\.py$')
-
-if [ -z "$STAGED_FILES" ]; then
-    echo "[+] No Python files to check"
-    exit 0
-fi
-
-# Run zhijian on staged files
-zhijian $STAGED_FILES --fail-threshold 50
-
-EXIT_CODE=$?
-
-if [ $EXIT_CODE -ne 0 ]; then
-    echo "[-] Code quality check failed! Fix issues before committing."
-    echo "    Run: zhijian <file> --verbose for details"
-    exit 1
-fi
-
-echo "[+] Code quality check passed!"
-exit 0
+python -m zhijian.git_hook_runner
 """
 
         try:
-            hook_path.write_text(hook_content)
+            hook_path.write_text(hook_content, encoding="utf-8")
             hook_path.chmod(0o755)  # Make executable
             print(f"[+] Pre-commit hook installed at: {hook_path}")
             return True

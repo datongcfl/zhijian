@@ -30,14 +30,14 @@ pip install zhijian
 # 扫描当前目录
 zhijian .
 
-# 只看高严重度问题
-zhijian --severity high
+# 输出 JSON 报告到 stdout
+zhijian --json
 
 # 导出 JSON 报告
 zhijian --output report.json
 
-# CI 模式（有问题就报错）
-zhijian --ci
+# CI 报告模式
+zhijian --ci-report --ci-mode hard
 ```
 
 ---

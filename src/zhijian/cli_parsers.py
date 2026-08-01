@@ -18,11 +18,10 @@ Examples:
   zhijian .                            # 扫描当前目录
   zhijian src/                         # 扫描指定目录
   zhijian file.py                      # 扫描单个文件
-  zhijian --severity high              # 只看高严重度问题
   zhijian --json                       # JSON 输出
   zhijian --report report.md           # 生成 Markdown 报告
   zhijian --output report.json         # 导出 JSON 报告
-  zhijian --ci                         # CI 模式
+  zhijian --ci-report --ci-mode hard   # CI 模式
   zhijian --list-patterns              # 列出所有检测规则
   zhijian --disable redundant_comment  # 禁用特定规则
   zhijian --init                       # 初始化配置文件
@@ -134,7 +133,7 @@ Examples:
     parser.add_argument(
         "--no-history",
         action="store_true",
-        help="Skip recording this run to history (~/.slop-detector/history.db)",
+        help="Skip recording this run to history (~/.zhijian/history.db)",
     )
     parser.add_argument(
         "--show-history", action="store_true", help="Show trend history for the given file and exit"
@@ -220,7 +219,7 @@ Examples:
 def _build_operations_parser(command: str) -> argparse.ArgumentParser:
     """Build a focused parser for review/cleanup commands."""
     parser = argparse.ArgumentParser(
-        prog=f"slop-detector {command}",
+        prog=f"zhijian {command}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=f"{command} operation for the AI SLOP detector",
     )
@@ -262,7 +261,7 @@ def _build_operations_parser(command: str) -> argparse.ArgumentParser:
 def build_sweep_parser(cleanup_families: Collection[str]) -> argparse.ArgumentParser:
     """Build the canonical cleanup parser surface."""
     parser = argparse.ArgumentParser(
-        prog="slop-detector sweep",
+        prog="zhijian sweep",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Cleanup sweep for the AI SLOP detector",
     )
@@ -284,7 +283,7 @@ def build_sweep_parser(cleanup_families: Collection[str]) -> argparse.ArgumentPa
 def _build_impact_parser() -> argparse.ArgumentParser:
     """Build parser for local impact commands."""
     parser = argparse.ArgumentParser(
-        prog="slop-detector impact",
+        prog="zhijian impact",
         description="Local repository impact tracking",
     )
     parser.add_argument(
@@ -307,7 +306,7 @@ def _build_impact_parser() -> argparse.ArgumentParser:
 def _build_telemetry_parser() -> argparse.ArgumentParser:
     """Build parser for telemetry control commands."""
     parser = argparse.ArgumentParser(
-        prog="slop-detector telemetry",
+        prog="zhijian telemetry",
         description="Opt-in telemetry controls",
     )
     parser.add_argument(

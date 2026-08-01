@@ -5,11 +5,11 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from slop_detector import operations_architecture as _architecture
-from slop_detector import operations_cleanup as _cleanup
-from slop_detector import operations_manifest as _manifest
-from slop_detector import operations_payloads as _payloads
-from slop_detector import operations_render as _render
+from zhijian import operations_architecture as _architecture
+from zhijian import operations_cleanup as _cleanup
+from zhijian import operations_manifest as _manifest
+from zhijian import operations_payloads as _payloads
+from zhijian import operations_render as _render
 
 _STDLIB_MODULES = _manifest._STDLIB_MODULES
 _compute_stdlib_modules = _manifest._compute_stdlib_modules

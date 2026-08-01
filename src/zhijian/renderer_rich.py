@@ -77,7 +77,7 @@ def list_patterns() -> None:
 
     print("\n" + "=" * 80)
     print(f"Total: {len(patterns)} patterns")
-    print("\nUsage: slop-detector --disable <pattern_id> ...")
+    print("\nUsage: zhijian --disable <pattern_id> ...")
 
 
 def _build_rich_summary_tables(result):

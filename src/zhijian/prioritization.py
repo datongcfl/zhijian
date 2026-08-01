@@ -160,13 +160,15 @@ class ProjectPrioritizer:
                 cwd=project_path,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=True,
             )
         except (FileNotFoundError, subprocess.CalledProcessError):
             return {}
 
         counts = {path: 0 for path in target_paths}
-        for line in result.stdout.splitlines():
+        for line in (result.stdout or "").splitlines():
             rel = line.strip()
             if not rel:
                 continue
@@ -214,11 +216,13 @@ class ProjectPrioritizer:
                 cwd=project_path,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=True,
             )
         except (FileNotFoundError, subprocess.CalledProcessError):
             return None
-        root = result.stdout.strip()
+        root = (result.stdout or "").strip()
         return Path(root).resolve() if root else None
 
     @staticmethod

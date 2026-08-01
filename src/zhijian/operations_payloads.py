@@ -6,10 +6,22 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
-from zhijian.analysis.cross_file import CrossFileAnalyzer
-from zhijian.ci_gate import CIGate
+from zhijian.ci.ci_gate import CIGate
 from zhijian.gate.models import GateMode
 from zhijian.operations_cleanup import _collect_cleanup_issues
+
+
+class _NoopCrossFileAnalyzer:
+    """Fallback cross-file analyzer used when the optional module is absent."""
+
+    def analyze(self, _project_path: str, _file_results: list) -> Dict[str, Any]:
+        return {}
+
+
+try:
+    from zhijian.analysis.cross_file import CrossFileAnalyzer
+except ModuleNotFoundError:
+    CrossFileAnalyzer = _NoopCrossFileAnalyzer
 
 
 def _run_git(args: List[str], cwd: Path) -> List[str]:
@@ -19,11 +31,13 @@ def _run_git(args: List[str], cwd: Path) -> List[str]:
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except Exception:
         return []
-    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
 
 
 def get_changed_files(project_path: Path, base_ref: str = "HEAD") -> List[str]:

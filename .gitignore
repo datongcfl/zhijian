@@ -28,6 +28,9 @@ _upstream/
 _extract/
 upstream.zip
 *.db
+
+# 运行产物(智检扫描报告)
+lottery-report*.md
 .coverage
 htmlcov/
 .pytest_cache/

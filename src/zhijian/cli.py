@@ -290,7 +290,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if argv_list and argv_list[0] == "telemetry":
         return _run_telemetry_command(argv_list[1:])
     if argv_list and argv_list[0] == "mcp":
-        from zhijian.mcp.server import run_stdio_server
+        try:
+            from zhijian.mcp.server import run_stdio_server
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("zhijian.mcp"):
+                print("[!] MCP support is not installed in this build.", file=sys.stderr)
+                return 2
+            raise
 
         return run_stdio_server()
     if argv_list and argv_list[0] == "verify-governance":

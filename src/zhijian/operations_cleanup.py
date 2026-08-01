@@ -40,9 +40,7 @@ def _looks_like_dead_code(file_path: str) -> bool:
     if _is_script_entrypoint(tree := _safe_parse_ast(source, path)):
         return False
 
-    if _has_placeholder_markers(source):
-        return True
-    return _has_placeholder_only_body(tree)
+    return _is_placeholder_only_module(tree)
 
 
 def _safe_parse_ast(source: str, path: Path) -> Optional[ast.AST]:
@@ -102,12 +100,100 @@ def _has_placeholder_only_body(tree: Optional[ast.AST]) -> bool:
     return False
 
 
+def _is_placeholder_only_module(tree: Optional[ast.AST]) -> bool:
+    if tree is None or not isinstance(tree, ast.Module):
+        return False
+
+    meaningful_nodes = [
+        node for node in tree.body if not _is_ignorable_module_statement(node)
+    ]
+    if not meaningful_nodes:
+        return False
+
+    return all(_is_placeholder_module_statement(node) for node in meaningful_nodes)
+
+
+def _is_ignorable_module_statement(node: ast.stmt) -> bool:
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return True
+    if _is_docstring_expr(node):
+        return True
+    if isinstance(node, ast.Assign):
+        return all(
+            isinstance(target, ast.Name) and target.id.isupper() for target in node.targets
+        ) and isinstance(node.value, ast.Constant)
+    if isinstance(node, ast.AnnAssign):
+        return (
+            isinstance(node.target, ast.Name)
+            and node.target.id.isupper()
+            and isinstance(node.value, ast.Constant)
+        )
+    return False
+
+
+def _is_placeholder_module_statement(node: ast.stmt) -> bool:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return _is_placeholder_statement_list(node.body)
+    if isinstance(node, ast.ClassDef):
+        body = [item for item in node.body if not _is_docstring_expr(item)]
+        return bool(body) and all(
+            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and _is_placeholder_statement_list(item.body)
+            for item in body
+        )
+    if isinstance(node, ast.Expr):
+        return _is_placeholder_expression(node)
+    if isinstance(node, ast.Pass):
+        return True
+    if isinstance(node, ast.Raise):
+        return _raises_not_implemented(node)
+    return False
+
+
+def _is_placeholder_statement_list(body: list[ast.stmt]) -> bool:
+    meaningful = [node for node in body if not _is_docstring_expr(node)]
+    if not meaningful:
+        return True
+    return all(
+        isinstance(node, ast.Pass)
+        or _is_placeholder_expression(node)
+        or _is_todo_comment_stub(node)
+        or _raises_not_implemented(node)
+        for node in meaningful
+    )
+
+
+def _is_docstring_expr(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(getattr(node, "value", None), ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
 def _is_placeholder_expression(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Expr)
         and isinstance(getattr(node, "value", None), ast.Constant)
         and getattr(node.value, "value", None) in (Ellipsis, "")
     )
+
+
+def _is_todo_comment_stub(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Return)
+        and isinstance(getattr(node, "value", None), ast.Constant)
+        and node.value.value is None
+    )
+
+
+def _raises_not_implemented(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Raise):
+        return False
+    exc = node.exc
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    return isinstance(exc, ast.Name) and exc.id == "NotImplementedError"
 
 
 def _build_hotspot_index(result) -> Dict[str, Any]:

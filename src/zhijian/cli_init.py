@@ -686,7 +686,7 @@ def _run_init(args: argparse.Namespace) -> int:
         _inject_gitignore_entry(
             Path(".gitignore"),
             entry=".slopconfig.yaml",
-            comment="# slop-detector: governance config (contains codebase complexity surface — keep private)",
+            comment="# zhijian: governance config (contains codebase complexity surface — keep private)",
         )
 
     if init_options["apply_init_suggestions"]:
@@ -704,8 +704,8 @@ def _run_init(args: argparse.Namespace) -> int:
             config_path,
             merged,
             comment_lines=[
-                "# .slopconfig.yaml — ai-slop-detector governance configuration",
-                "# Updated by: slop-detector --init --apply-init-suggestions",
+                "# .slopconfig.yaml — zhijian governance configuration",
+                "# Updated by: zhijian --init --apply-init-suggestions",
                 "# Adaptive init suggestions are evidence-backed and opt-in.",
             ],
         )
@@ -717,7 +717,7 @@ def _run_init(args: argparse.Namespace) -> int:
 
     print()
     print("[>] Next steps:")
-    print("    slop-detector --project .")
+    print("    zhijian --project .")
     print(f"    # domain profile: {profile.get('description', '')}")
     print()
     print("[!] Security: .slopconfig.yaml is in .gitignore (maps acceptable-complexity surface).")

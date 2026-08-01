@@ -48,7 +48,11 @@ def _run_gate(result) -> None:
 
 def _run_autofix(result, dry_run: bool = True) -> None:
     """Run auto-fix engine on analysis results."""
-    from zhijian.autofix.engine import FixEngine
+    try:
+        from zhijian.autofix.engine import FixEngine
+    except ModuleNotFoundError:
+        print("[!] Auto-fix support is not installed in this build.")
+        return
 
     engine = FixEngine()
     mode = "DRY RUN" if dry_run else "APPLYING"
@@ -117,7 +121,11 @@ def _run_js_analysis(path: str) -> None:
 
 def _run_cross_file(result) -> None:
     """Run cross-file analysis on project results."""
-    from zhijian.analysis.cross_file import CrossFileAnalyzer
+    try:
+        from zhijian.analysis.cross_file import CrossFileAnalyzer
+    except ModuleNotFoundError:
+        print("[!] Cross-file analysis support is not installed in this build.")
+        return
 
     analyzer = CrossFileAnalyzer()
     report = analyzer.analyze(
@@ -153,7 +161,11 @@ def _run_cross_file(result) -> None:
 
 def _run_governance(path: str, result) -> None:
     """Emit CR-EP v2.7.2 session artifacts."""
-    from zhijian.governance.session import AnalysisSession
+    try:
+        from zhijian.governance.session import AnalysisSession
+    except ModuleNotFoundError:
+        print("[!] Governance support is not installed in this build.")
+        return
 
     project_path = Path(path).resolve()
     if not project_path.is_dir():
@@ -215,10 +227,14 @@ def _resolve_governance_record_path(target: str) -> Path:
 
 def _run_verify_governance(target: str) -> int:
     """Verify governance artifact integrity and policy constraints."""
-    from zhijian.governance.verification import (
-        GovernanceVerificationError,
-        verify_governance_record,
-    )
+    try:
+        from zhijian.governance.verification import (
+            GovernanceVerificationError,
+            verify_governance_record,
+        )
+    except ModuleNotFoundError:
+        print("[!] Governance verification support is not installed in this build.", file=sys.stderr)
+        return 2
 
     record_path = _resolve_governance_record_path(target)
     try:

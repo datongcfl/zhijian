@@ -1,4 +1,4 @@
-"""Local repository impact tracking for repeated slop-detector use."""
+"""Local repository impact tracking for repeated zhijian use."""
 
 from __future__ import annotations
 

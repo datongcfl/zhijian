@@ -216,7 +216,7 @@ def next_steps(result: Any) -> List[str]:
     if not bad and not warn and deficit_files == 0:
         return [
             "All metrics are healthy - no action needed. "
-            "Add `slop-detector --project . --ci-mode hard` to CI to keep it that way."
+            "Add `zhijian --project . --ci-mode hard` to CI to keep it that way."
         ]
 
     steps: List[str] = []
@@ -231,8 +231,8 @@ def next_steps(result: Any) -> List[str]:
             "flagged. The hotspots below are pulling specific files down."
         )
         steps.append(
-            "Run `slop-detector sweep dead-code .` for placeholder/dead files, "
-            "then `slop-detector sweep dupes .` for duplicated logic."
+            "Run `zhijian sweep dead-code .` for placeholder/dead files, "
+            "then `zhijian sweep dupes .` for duplicated logic."
         )
     else:
         label = concern["label"]
@@ -242,7 +242,7 @@ def next_steps(result: Any) -> List[str]:
         )
         if "Dependency Usage" in label:
             steps.append(
-                "Run `slop-detector sweep unused-deps .` to list imports and "
+                "Run `zhijian sweep unused-deps .` to list imports and "
                 "dependencies that are declared but never used."
             )
         elif "Inflation" in label:
@@ -252,20 +252,20 @@ def next_steps(result: Any) -> List[str]:
             )
         else:  # deficit or logic-density concern
             steps.append(
-                "Run `slop-detector sweep dead-code .` for placeholder/dead files, "
-                "then `slop-detector sweep dupes .` for duplicated logic."
+                "Run `zhijian sweep dead-code .` for placeholder/dead files, "
+                "then `zhijian sweep dupes .` for duplicated logic."
             )
 
     if hotspots:
         top = hotspots[0]
         steps.append(
             f"Start with `{Path(top.file_path).name}` (deficit "
-            f"{getattr(top, 'deficit_score', 0.0):.1f}); use `slop-detector review .` "
+            f"{getattr(top, 'deficit_score', 0.0):.1f}); use `zhijian review .` "
             "to scope this to changed code only."
         )
     elif deficit_files > 0:
         steps.append(
-            "Run `slop-detector review .` to focus on slop introduced in your "
+            "Run `zhijian review .` to focus on slop introduced in your "
             "changed files only."
         )
 

@@ -208,7 +208,8 @@ def evaluate_ci_gate(args, result):
     claims_strict = getattr(args, "ci_claims_strict", False)
     if not (args.ci_mode or args.ci_report or claims_strict):
         return None
-    from zhijian.ci_gate import CIGate, GateMode
+    from zhijian.ci.ci_gate import CIGate
+    from zhijian.gate.models import GateMode
 
     gate_mode = GateMode(args.ci_mode) if args.ci_mode else GateMode.SOFT
     gate_result = CIGate(mode=gate_mode, claims_strict=claims_strict).evaluate(result)
