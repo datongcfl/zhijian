@@ -32,7 +32,7 @@ def _staged_python_files() -> list[str]:
 
 
 def run(argv: Sequence[str] | None = None) -> int:
-    _ = argv
+    extra_args = list(argv) if argv else []
     print("[*] Running Zhijian on staged Python files...")
 
     files = _staged_python_files()
@@ -42,17 +42,25 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     exit_code = 0
     for file_path in files:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "zhijian.cli",
-                file_path,
-                "--no-history",
-                "--fail-threshold",
-                "70",
-            ]
-        )
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "zhijian.cli",
+                    file_path,
+                    "--no-history",
+                    "--fail-threshold",
+                    "70",
+                    *extra_args,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[-] Zhijian timed out on {file_path}", file=sys.stderr)
+            return 1
         if result.returncode != 0:
             exit_code = result.returncode
 

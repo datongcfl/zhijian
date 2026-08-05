@@ -1,6 +1,7 @@
 """Configuration management for SLOP detector."""
 
 import logging as _logging
+import math
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -20,6 +21,7 @@ try:
     from pydantic import BaseModel as _BaseModel
     from pydantic import Field as _Field
     from pydantic import ValidationError as _ValidationError
+    from pydantic import model_validator as _model_validator
 
     class _WeightsSchema(_BaseModel):
         model_config = {"extra": "allow"}
@@ -27,6 +29,13 @@ try:
         inflation: float = _Field(default=0.30, ge=0.0, le=1.0)
         ddc: float = _Field(default=0.20, ge=0.0, le=1.0)
         purity: float = _Field(default=0.10, ge=0.0, le=1.0)
+
+        @_model_validator(mode="after")
+        def _weights_sum_to_one(self) -> "_WeightsSchema":
+            total = self.ldr + self.inflation + self.ddc + self.purity
+            if not math.isclose(total, 1.0, abs_tol=1e-6):
+                raise ValueError(f"weights must sum to 1.0, got {total:.4f}")
+            return self
 
     class _DomainOverrideSchema(_BaseModel):
         model_config = {"extra": "allow"}

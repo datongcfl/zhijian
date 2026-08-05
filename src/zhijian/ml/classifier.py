@@ -20,8 +20,11 @@ Version: 2.2.0
 Date: 2026-01-08
 """
 
+import hashlib
+import hmac
 import json
 import logging
+import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +54,17 @@ except ImportError:
     XGBOOST_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# Signing key for model files. Override via ZHIJIAN_MODEL_KEY to rotate.
+# The HMAC envelope detects corruption/tampering; it is not a substitute for
+# trusting the model source. Only load models you produced or verified.
+_MODEL_FORMAT = "zhijian-model-v1"
+_MODEL_SIGNING_KEY = os.environ.get("ZHIJIAN_MODEL_KEY", "zhijian-model-v1").encode("utf-8")
+
+
+def _sign_model(payload: bytes) -> str:
+    """Return an HMAC-SHA256 hex signature over a pickled payload."""
+    return hmac.new(_MODEL_SIGNING_KEY, payload, hashlib.sha256).hexdigest()
 
 
 @dataclass
@@ -304,7 +318,11 @@ class SlopClassifier:
             raise ValueError(f"Unknown model type: {self.model_type}")
 
     def save(self, output_path: Path):
-        """Save trained model to disk."""
+        """Save trained model to disk.
+
+        Writes an HMAC-signed envelope so that :meth:`load` can detect
+        corruption or tampering before deserializing the payload.
+        """
         if not self.is_trained:
             raise RuntimeError("Model not trained")
 
@@ -315,15 +333,56 @@ class SlopClassifier:
             "feature_names": self.FEATURE_NAMES,
         }
 
+        payload = pickle.dumps(model_data)
+        envelope = {
+            "format": _MODEL_FORMAT,
+            "signature": _sign_model(payload),
+            "payload": payload,
+        }
         with open(output_path, "wb") as f:
-            pickle.dump(model_data, f)
+            pickle.dump(envelope, f)
 
         logger.info(f"Model saved to {output_path}")
 
     def load(self, model_path: Path):
-        """Load trained model from disk."""
+        """Load trained model from disk.
+
+        Refuses to deserialize the payload unless its HMAC signature matches,
+        and validates the resulting structure. Legacy (unsigned) model files are
+        accepted only for backward compatibility after structural validation.
+        """
         with open(model_path, "rb") as f:
-            model_data = pickle.load(f)
+            data = pickle.load(f)
+
+        legacy = not (isinstance(data, dict) and data.get("format") == _MODEL_FORMAT)
+        if legacy:
+            logger.warning(
+                "Loading legacy unsigned model %s; re-save it to enable "
+                "tamper detection.",
+                model_path,
+            )
+            model_data = data
+        else:
+            expected = _sign_model(data["payload"])
+            if not hmac.compare_digest(expected, data["signature"]):
+                raise ValueError(
+                    f"Model signature mismatch for {model_path}: "
+                    "file may be corrupted or tampered with"
+                )
+            model_data = pickle.loads(data["payload"])
+
+        # Structural validation: reject foreign/broken model files early.
+        if not isinstance(model_data, dict):
+            raise ValueError("Invalid model file: expected a model dict")
+        if set(model_data) != {"model_type", "rf_model", "xgb_model", "feature_names"}:
+            raise ValueError("Invalid model file: unexpected structure")
+        if model_data["model_type"] not in {"random_forest", "xgboost", "ensemble"}:
+            raise ValueError(f"Invalid model type: {model_data['model_type']}")
+        if list(model_data["feature_names"]) != list(self.FEATURE_NAMES):
+            raise ValueError(
+                "Model feature_names do not match this classifier version; "
+                "retrain the model"
+            )
 
         self.model_type = model_data["model_type"]
         self.rf_model = model_data["rf_model"]

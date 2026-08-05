@@ -300,12 +300,11 @@ class SlopDetector:
         # Prevents bad files from being diluted by the average.
         ldr_scores = [self._result_ldr_score(r) for r in all_results]
         avg_ldr = 0.6 * min(ldr_scores) + 0.4 * (sum(ldr_scores) / total_files)
-        avg_inflation = sum(
-            r.inflation.inflation_score
-            for r in results
-            if math.isfinite(r.inflation.inflation_score)
-        ) / max(1, sum(1 for r in results if math.isfinite(r.inflation.inflation_score)))
-        avg_ddc = sum(r.ddc.usage_ratio for r in results) / max(1, len(results))
+        # Inflation/DDC aggregation now spans all languages for consistency with
+        # avg_deficit_score/avg_ldr; languages without those detectors use a
+        # neutral value (0.0 inflation, 1.0 DDC) via the _result_* helpers.
+        avg_inflation = sum(self._result_inflation_score(r) for r in all_results) / total_files
+        avg_ddc = sum(self._result_ddc_ratio(r) for r in all_results) / total_files
 
         # Weighted average (by LOC)
         if self.config.use_weighted_analysis():
@@ -901,6 +900,23 @@ class SlopDetector:
         if hasattr(result, "ldr"):
             return float(getattr(result.ldr, "ldr_score", 0.0))
         return float(getattr(result, "ldr_equivalent", 0.0))
+
+    @staticmethod
+    def _result_inflation_score(result: Any) -> float:
+        """Inflation score with a neutral 0.0 fallback for languages without the detector."""
+        inflation = getattr(result, "inflation", None)
+        if inflation is None:
+            return 0.0  # JS/Go have no inflation detector; treat as clean
+        score = getattr(inflation, "inflation_score", 0.0)
+        return score if isinstance(score, float) and math.isfinite(score) else 0.0
+
+    @staticmethod
+    def _result_ddc_ratio(result: Any) -> float:
+        """DDC usage ratio with a neutral 1.0 fallback for languages without the detector."""
+        ddc = getattr(result, "ddc", None)
+        if ddc is None:
+            return 1.0  # JS/Go have no DDC detector; treat as clean
+        return float(getattr(ddc, "usage_ratio", 1.0))
 
     def _should_ignore(
         self, file_path: Path, patterns: List[str], root: Optional[Path] = None
